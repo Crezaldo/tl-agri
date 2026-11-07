@@ -1,0 +1,163 @@
+# ============================================================
+# Project configuration - Monitoring & Prediction of
+# Agricultural Prices in Timor-Leste
+# All URLs and polling intervals live here (not hardcoded).
+# ============================================================
+
+paths:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  log_file: data/metadata/collection_log.csv
+
+http:
+  user_agent: "DIT-Capstone-TL-AgriPrice/1.0 (student research project)"
+  timeout_seconds: 60
+  max_retries: 3
+  backoff_seconds: 5          # wait 5s, 10s, 15s between retries
+
+sources:
+  wfp:
+    enabled: true
+    description: "WFP retail food prices for Timor-Leste via HDX (CKAN API)"
+    ckan_api: "https://data.humdata.org/api/3/action/package_show"
+    dataset_id: "wfp-food-prices-for-timor-leste"
+    # Source publishes monthly; we poll weekly so new months are
+    # captured within 7 days of release.
+    source_update_frequency: monthly
+    polling_interval: weekly
+    expected_columns:
+      - date
+      - admin1
+      - market
+      - commodity
+      - unit
+      - pricetype
+      - currency
+      - price
+
+  worldbank:
+    enabled: true
+    description: "World Bank Commodity Price Data (Pink Sheet), monthly"
+    page_url: "https://www.worldbank.org/en/research/commodity-markets"
+    # The download URL contains a hash that changes each month, so we
+    # discover it from the page instead of hardcoding it.
+    file_pattern: "CMO-Historical-Data-Monthly.xlsx"
+    sheet_name: "Monthly Prices"
+    source_update_frequency: monthly
+    polling_interval: monthly
+
+# ============================================================
+# Preprocessing (Step 3)
+# ============================================================
+preprocessing:
+  # Map WFP commodity names -> short keys. Only mapped items are kept.
+  # Scope decision: rice, maize, beans = main targets; tubers/vegetables
+  # replace "fruits" (WFP has no fruit series for Timor-Leste).
+  wfp_commodity_map:
+    "Rice (white, imported)": rice_imported
+    "Rice (white, local)": rice_local
+    "Maize": maize
+    "Beans (kidney)": beans_kidney
+    "Sweet potatoes": sweet_potatoes
+    "Taro": taro
+    "Tomatoes (local)": tomatoes_local
+    "Cassava": cassava
+  pricetype: Retail
+  # Robust outlier flag: |log price - median| / MAD above this = outlier
+  outlier_mad_threshold: 5.0
+  # Fill missing months in the national series only for short gaps
+  max_interpolation_gap_months: 2
+  # National series method:
+  #   market_adjusted = robust two-way model (month level + market premium),
+  #                     removes jumps caused by changing reporting markets
+  #   median          = simple median of reporting markets (kept for comparison)
+  national_method: market_adjusted
+  # Months with fewer reporting markets get low_coverage = True
+  min_markets: 3
+  # Market premiums are estimated separately per continuous segment;
+  # a gap of >= this many missing months starts a new segment
+  segment_gap_months: 6
+  # Isolated spike correction on the national series: a month that jumps
+  # away from BOTH neighbours by more than max(k * MAD, min %) and reverts
+  # is replaced by interpolation (spike_corrected = True)
+  spike_mad_k: 4.0
+  spike_min_jump_pct: 25
+
+  # World Bank series -> short keys (names must match the workbook)
+  worldbank_commodity_map:
+    "Rice, Thai 5%": world_rice_thai5
+    "Maize": world_maize
+    "Soybeans": world_soybeans
+    "Coffee, Arabica": world_coffee_arabica
+    "Coffee, Robusta": world_coffee_robusta
+    "Banana, US": world_banana
+    "Orange": world_orange
+
+# ============================================================
+# Modeling scope (decided from check_gaps.py results)
+# ============================================================
+modeling:
+  start: "2020-05-01"        # first month all series are continuous
+  end: null                  # null = latest available month
+  test_months: 12
+  targets_primary: [rice_imported, rice_local, maize]
+  targets_secondary: [beans_kidney, taro, tomatoes_local]
+  eda_only: [sweet_potatoes]
+  excluded: [cassava]        # only 2011-10 to 2013-10, discontinued
+
+# ============================================================
+# EDA (Step 4)
+# ============================================================
+eda:
+  figures_dir: reports/figures/eda
+  tables_dir: reports/tables
+  export_png: true           # needs 'kaleido'; skipped if not installed
+  # Pairs: local series -> world series, for indexed comparison
+  local_world_pairs:
+    rice_imported: world_rice_thai5
+    maize: world_maize
+  # Context events drawn on charts (verify dates before citing in report)
+  events:
+    "2020-03-01": "COVID-19 state of emergency (TL)"
+    "2022-03-01": "Global food/fuel price shock"
+    "2023-07-01": "India rice export restrictions"
+
+# ============================================================
+# Pattern Mining (Step 5)
+# ============================================================
+mining:
+  figures_dir: reports/figures/mining
+  tables_dir: reports/tables
+  stl_period: 12             # monthly data, yearly seasonality
+  max_lag_months: 6          # world -> local price transmission lags tested
+  anomaly_z: 3.0             # robust z-score of monthly change
+  n_market_clusters: 3       # KMeans on municipality price premiums
+  random_state: 42
+
+# ============================================================
+# Forecasting (Step 6)
+# ============================================================
+forecasting:
+  horizon: 1                 # backtest: one-step-ahead (next month)
+  future_months: 3           # final forecast beyond the last observed month
+  figures_dir: reports/figures/forecast
+  tables_dir: reports/tables
+  models_dir: models
+  output_file: data/processed/forecasts.csv
+  # Machine-learning features (all use information up to month t-1 only)
+  lags: [1, 2, 3]            # lags of monthly log change
+  seasonal_lag: 12
+  rolling_window: 12
+  random_forest:
+    n_estimators: 300
+    max_depth: 4
+    min_samples_leaf: 3
+    random_state: 42
+  arima:
+    p_values: [0, 1, 2]
+    q_values: [0, 1, 2]
+    seasonal_P: [0, 1]       # SARIMA seasonal AR term with period 12
+  # Ablation: add world price changes (lags 1-3) as features for these pairs
+  world_feature_pairs:
+    rice_imported: world_rice_thai5
+    maize: world_maize
